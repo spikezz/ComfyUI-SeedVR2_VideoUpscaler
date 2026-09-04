@@ -44,6 +44,7 @@ from .alpha_upscaling import process_alpha_for_batch
 from .infer import VideoDiffusionInfer
 from ..common.seed import set_seed
 from ..optimization.memory_manager import (
+    clear_memory,
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
@@ -532,6 +533,19 @@ def encode_all_batches(
         if ctx['vae_offload_device'] is not None:
             manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'], 
                                 model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
+
+        # The next phase materializes the DiT and needs a large contiguous
+        # attention workspace.  Tiled VAE encoding can leave most of VRAM in
+        # PyTorch's allocator cache even after every live tensor/model has
+        # moved to CPU, which makes otherwise valid temporal batches OOM at
+        # the first DiT attention allocation.  Release only cached blocks here;
+        # encoded latents already live on tensor_offload_device.
+        clear_memory(
+            debug=debug,
+            deep=False,
+            force=True,
+            timer_name="phase1_to_phase2",
+        )
     
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
@@ -648,6 +662,18 @@ def upscale_all_batches(
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
                             model_name="DiT", debug=debug, runner=runner)
+
+        # Model materialization and FP8 compatibility conversion use temporary
+        # CUDA allocations.  They are dead before inference but can leave the
+        # allocator fully reserved and too fragmented for the first large
+        # attention/RoPE workspace.  Keep all live weights, release only those
+        # cached materialization blocks.
+        clear_memory(
+            debug=debug,
+            deep=False,
+            force=True,
+            timer_name="dit_materialization_to_inference",
+        )
 
         debug.log_memory_state("After DiT loading for upscaling", detailed_tensors=False)
 
@@ -797,6 +823,16 @@ def upscale_all_batches(
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
+
+        # DiT and VAE decoding have different allocation shapes.  Returning
+        # the now-unused DiT cache avoids fragmentation at the second model
+        # boundary without touching the CPU-offloaded upscaled latents.
+        clear_memory(
+            debug=debug,
+            deep=False,
+            force=True,
+            timer_name="phase2_to_phase3",
+        )
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
