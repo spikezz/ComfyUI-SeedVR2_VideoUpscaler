@@ -40,8 +40,12 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
     k_splits = list(torch.tensor_split(k, cu_seqlens_k[1:-1].long().cpu(), dim=0))
     v_splits = list(torch.tensor_split(v, cu_seqlens_k[1:-1].long().cpu(), dim=0))
 
-    # Process each sequence
-    output_splits = []
+    # Keep only the final buffer and the current window output alive.  Allocate
+    # from the first SDPA result: autocast can change its dtype, and value's
+    # head dimension need not equal query's.  new_empty gives the same contiguous
+    # layout as the old cat without aliasing or overwriting q, k, or v.
+    output = None
+    offset = 0
     for q_i, k_i, v_i in zip(q_splits, k_splits, v_splits):
         # Reshape for torch's scaled_dot_product_attention which expects (batch, heads, seq, dim).
         # Here, we treat each sequence as a batch of 1.
@@ -58,10 +62,15 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
 
         # Reshape the output back to the original format (seq_len, heads, head_dim)
         output_i = output_i.squeeze(0).permute(1, 0, 2)
-        output_splits.append(output_i)
-    
-    # Concatenate all outputs
-    return torch.cat(output_splits, dim=0)
+        if output is None:
+            output = output_i.new_empty((q.shape[0], *output_i.shape[1:]))
+        length = output_i.shape[0]
+        output[offset:offset + length].copy_(output_i)
+        offset += length
+        # Do not retain the previous output while computing the next window.
+        del output_i
+
+    return output
 
 
 class TorchAttention(nn.Module):
