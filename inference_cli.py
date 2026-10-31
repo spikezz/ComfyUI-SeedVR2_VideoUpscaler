@@ -730,7 +730,8 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
     else:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(file_path, frame_bgr)
+    if not cv2.imwrite(file_path, frame_bgr):
+        raise OSError(f"Failed to write image: {file_path}")
 
 
 def save_frames_to_video(
@@ -1044,6 +1045,9 @@ def _worker_process(
     worker_debug = Debug(enabled=shared_args["debug"])
     
     args = argparse.Namespace(**shared_args)
+    worker_args = argparse.Namespace(**vars(args))
+    if proc_idx != 0:
+        worker_args.prepend_frames = 0
     
     # Video streaming mode: worker reads and processes its assigned segment
     if video_info is not None:
@@ -1057,15 +1061,10 @@ def _worker_process(
                         f"({segment_frames} frames, chunks of {chunk_size})",
                         category="generation", force=True)
         
-        # Only GPU 0 uses prepend_frames (applies to video start only)
-        worker_args = argparse.Namespace(**vars(args))
-        if proc_idx != 0:
-            worker_args.prepend_frames = 0
-        
         # Enable model caching within worker only if requested
         runner_cache = {} if (args.cache_dit or args.cache_vae) else None
         
-        total_chunks = (segment_frames + chunk_size - 1) // chunk_size
+        total_chunks = (segment_frames + chunk_size - 1) // chunk_size if segment_frames > 0 else 0
         results = []
         for result in _stream_video_chunks(
             cap=cap,
@@ -1090,7 +1089,7 @@ def _worker_process(
         frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
         result_tensor = _process_frames_core(
             frames_tensor=frames_tensor,
-            args=args,
+            args=worker_args,
             device_id="0",
             debug=worker_debug,
             runner_cache=None
@@ -1149,9 +1148,36 @@ def _gpu_processing(
     Returns:
         Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
     """
+    if not device_list:
+        raise ValueError("At least one processing device is required")
+    if video_info is None and frames_tensor is None:
+        raise ValueError("Frames or video_info are required")
+    total_frames = video_info['frames_to_process'] if video_info is not None else frames_tensor.shape[0]
+    if total_frames <= 0:
+        raise ValueError("At least one frame is required")
+    device_list = device_list[:total_frames]
     num_devices = len(device_list)
     overlap = args.temporal_overlap
-    
+
+    # Determine actual nonempty work before allocating the result queue/barrier.
+    # torch.chunk may return fewer parts than requested even with T >= devices.
+    if video_info is None:
+        if overlap > 0 and num_devices > 1:
+            chunk_with_overlap = total_frames // num_devices + overlap
+            if args.batch_size > 1:
+                chunk_with_overlap = ((chunk_with_overlap + args.batch_size - 1) // args.batch_size) * args.batch_size
+            base_chunk_size = chunk_with_overlap - overlap
+            chunks = []
+            for i in range(num_devices):
+                start_idx = i * base_chunk_size
+                end_idx = total_frames if i == num_devices - 1 else min(start_idx + chunk_with_overlap, total_frames)
+                if start_idx < total_frames:
+                    chunks.append(frames_tensor[start_idx:end_idx])
+        else:
+            chunks = list(torch.tensor_split(frames_tensor, num_devices, dim=0))
+        device_list = device_list[:len(chunks)]
+        num_devices = len(device_list)
+
     return_queue = mp.Queue(maxsize=0)
     done_barrier = mp.Barrier(num_devices + 1)
     workers = []
@@ -1192,27 +1218,8 @@ def _gpu_processing(
             
             current_start += gpu_frames
     
-    # Pre-loaded frames mode (original behavior for images or non-streaming)
+    # Pre-loaded frames mode: chunks were planned before IPC allocation.
     else:
-        total_frames = frames_tensor.shape[0]
-        
-        if overlap > 0 and num_devices > 1:
-            chunk_with_overlap = total_frames // num_devices + overlap
-            if args.batch_size > 1:
-                chunk_with_overlap = ((chunk_with_overlap + args.batch_size - 1) // args.batch_size) * args.batch_size
-            base_chunk_size = chunk_with_overlap - overlap
-
-            chunks = []
-            for i in range(num_devices):
-                start_idx = i * base_chunk_size
-                if i == num_devices - 1:
-                    end_idx = total_frames
-                else:
-                    end_idx = min(start_idx + chunk_with_overlap, total_frames)
-                chunks.append(frames_tensor[start_idx:end_idx])
-        else:
-            chunks = torch.chunk(frames_tensor, num_devices, dim=0)
-
         for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
             os.environ["CUDA_VISIBLE_DEVICES"] = device_id
             p = mp.Process(
